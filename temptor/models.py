@@ -4,10 +4,12 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import scipy.sparse as spr
 import umap
-from embedding_explorer.model import Model
 from gensim.models import Word2Vec
-from sklearn.metrics import pairwise_distances
+from sklearn.base import BaseEstimator
+from sklearn.linear_model import Ridge
+from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 
 
@@ -75,3 +77,115 @@ def train_umap(embeddings: np.ndarray) -> umap.UMAP:
     """
     mean_embeddings = np.mean(embeddings, axis=0)
     return umap.UMAP().fit(mean_embeddings)
+
+
+class TemporalAffinityModel(BaseEstimator):
+    """Temporal word embedding model based on cosine affinities of words in
+    document embedding space and dimensionality reduction.
+
+    Parameters
+    ----------
+    vectorizer
+        Vectorizer model that produces embeddings of documents.
+        The vectorizer HAS TO BE fitted before passed to this model.
+    dim_red
+        Dimentionality reduction model that will be used for
+        reducing the dimentionality of the embeddings from the
+        similarity matrices.
+        The model SHOULD NOT BE fitted before passed to this model.
+
+    Attributes
+    ----------
+    vocab: array of shape (n_vocab)
+        Array of output features of the vectorizer, aka.
+        the the order in which words will be arranged in the produced
+        embeddings.
+
+    components_: array of shape (n_dimensions, n_vocab)
+        Linearly estimated term importances for each term, or
+        components of the dimentionality reduction method.
+    """
+
+    def __init__(self, vectorizer, dim_red):
+        super().__init__()
+        self.vectorizer = vectorizer
+        self.dim_red = dim_red
+        self.vocab = None
+        self.components_ = None
+
+    def _get_affinities(self, periods: Iterable[Iterable[str]]):
+        affinities = []
+        for period in periods:
+            dtm = self.vectorizer.transform(period)
+            affinity = cosine_similarity(dtm.T, dense_output=False)
+            affinities.append(affinity)
+        return affinities
+
+    def fit(self, periods: Iterable[Iterable[str]]):
+        """Fits the model on the given periods.
+
+        Parameters
+        ----------
+        periods: iterable of iterable of str
+            All documents for each period.
+
+        Returns
+        -------
+        TemporalAffinityModel
+            Fitted model.
+        """
+        self.vocab = self.vectorizer.get_feature_names_out()
+        affinities = self._get_affinities(periods)
+        affinities = spr.vstack(affinities)
+        y = self.dim_red.fit_transform(affinities)
+        try:
+            self.components_ = self.dim_red.components_
+        except AttributeError:
+            ridge = Ridge(fit_intercept=False).fit(affinities, y)
+            self.components_ = ridge.coef_
+        return self
+
+    def transform(self, periods: Iterable[Iterable[str]]) -> np.ndarray:
+        """Transforms the periods into temporal word embeddings for each
+        period.
+
+        Parameters
+        ----------
+        periods: iterable of iterable of str
+            All documents for each period.
+
+        Returns
+        -------
+        array of shape (n_periods, n_vocab, n_dimentions)
+            Embeddings of all words for each period.
+        """
+        if self.vocab is None:
+            raise ValueError(
+                "Model has not yet been fitted, plese fit before transforming."
+            )
+        else:
+            n_vocab = len(self.vocab)
+        n_dimensions = self.dim_red.n_components
+        affinities = self._get_affinities(periods)
+        n_periods = len(affinities)
+        affinities = spr.vstack(affinities)
+        embeddings = self.dim_red.transform(affinities)
+        embeddings = embeddings.reshape((n_periods, n_vocab, n_dimensions))
+        return embeddings
+
+    def fit_transform(self, periods: Iterable[Iterable[str]]) -> np.ndarray:
+        """Fits the model, then transforms the periods
+        into temporal word embeddings for each period.
+
+        Parameters
+        ----------
+        periods: iterable of iterable of str
+            All documents for each period.
+
+        Returns
+        -------
+        array of shape (n_periods, n_vocab, n_dimentions)
+            Embeddings of all words for each period.
+        """
+        self.fit(periods)
+        return self.transform(periods)
